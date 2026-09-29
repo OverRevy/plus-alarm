@@ -1,0 +1,8 @@
+APK MAKEN (zonder Android Studio):
+1. Maak gratis account op github.com -> New repository (bv. "plus-alarm").
+2. Upload ALLES uit deze map (incl. de verborgen map .github). Of: unzip en sleep alles in de repo.
+3. Ga naar tabblad "Actions" -> wacht ~5 min tot "Build APK" groen is.
+4. Klik op de run -> onderaan "Artifacts" -> plus-alarm-apk downloaden -> unzippen -> app-debug.apk.
+5. Zet APK op je telefoon, installeer (sta "onbekende bronnen" toe).
+6. Open app -> locatie op "Altijd toestaan" -> batterij-optimalisatie uit -> START.
+Testen in browser: open www/index.html in Chrome.

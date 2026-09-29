@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Plus Alarm</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --bg:#111; --card:#1e1e1e; --txt:#f2f2f2; --acc:#ff3b30; --ok:#34c759; --mut:#999; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font-family:system-ui,sans-serif;
+         padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+  header { padding:14px 16px; font-size:20px; font-weight:700; }
+  .card { background:var(--card); margin:10px 12px; padding:12px; border-radius:14px; }
+  button { font-size:16px; padding:12px 14px; border:0; border-radius:10px; background:#333; color:var(--txt); margin:3px 0; }
+  button.big { width:100%; font-size:20px; padding:18px; background:var(--ok); color:#000; font-weight:700; }
+  button.big.on { background:var(--acc); color:#fff; }
+  #map { height:260px; border-radius:12px; margin-top:8px; }
+  .row { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:6px 0; }
+  .mut { color:var(--mut); font-size:13px; }
+  input[type=text], input[type=number], textarea { width:100%; padding:10px; border-radius:8px; border:1px solid #444;
+         background:#111; color:var(--txt); font-size:16px; }
+  input[type=range] { width:100%; }
+  #overlay { display:none; position:fixed; inset:0; background:var(--acc); z-index:9999; flex-direction:column;
+             justify-content:center; align-items:center; text-align:center; padding:24px; animation:flash 1s infinite; }
+  @keyframes flash { 50% { background:#8b0000; } }
+  #overlay h1 { font-size:34px; margin:0 0 16px; }
+  #overlay p { font-size:22px; }
+  #overlay button { background:#fff; color:#000; font-size:20px; margin-top:24px; padding:16px 24px; }
+  .del { background:#552; padding:6px 10px; }
+</style>
+</head>
+<body>
+<header>🛑 Plus Alarm</header>
+
+<div class="card">
+  <button class="big" id="toggle">▶ START BEWAKING</button>
+  <div class="mut" id="status">Uit</div>
+</div>
+
+<div class="card">
+  <b>Locaties</b>
+  <div>
+    <button id="findPlus">🔍 Zoek alle Plus in de buurt (15 km)</button>
+    <button id="addHere">📍 Voeg mijn huidige plek toe</button>
+  </div>
+  <div class="mut">Of tik op de kaart om zelf een plek te markeren.</div>
+  <div id="map"></div>
+  <div id="list"></div>
+</div>
+
+<div class="card">
+  <b>Instellingen</b>
+  <div class="row"><span>Afstand: <b id="rv"></b> m</span></div>
+  <input type="range" id="radius" min="50" max="1000" step="10">
+  <div class="row"><span>Niet opnieuw melden binnen: <b id="cv"></b> min</span></div>
+  <input type="range" id="cooldown" min="1" max="60" step="1">
+  <div class="row"><span>🔔 Piep</span><input type="checkbox" id="beep"></div>
+  <div class="row"><span>📳 Trillen</span><input type="checkbox" id="vibrate"></div>
+  <div class="row"><span>🗣 Stem voorlezen</span><input type="checkbox" id="speak"></div>
+  <div class="mut" style="margin-top:6px">Melding:</div>
+  <textarea id="message" rows="3"></textarea>
+  <button id="test">🔊 Test alarm</button>
+</div>
+
+<div class="card mut">
+  Tip: zet locatie op <b>"Altijd toestaan"</b> en zet batterij-optimalisatie voor deze app uit,
+  anders stopt Android hem op de achtergrond.
+</div>
+
+<div id="overlay">
+  <h1>🛑 STOP!</h1>
+  <p id="ovmsg"></p>
+  <button id="ovok">Ik loop door 💪</button>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+// ---------- state ----------
+const DEF = { radius:150, cooldown:10, beep:true, vibrate:true, speak:true,
+  message:"Je bent bij de Plus. Niet naar binnen voor stress-eten. Adem in, loop door." };
+let places = JSON.parse(localStorage.getItem('places') || '[]');
+let S = Object.assign({}, DEF, JSON.parse(localStorage.getItem('settings') || '{}'));
+const lastAlert = {};
+let running = false, watcherId = null, browserWatch = null, me = null, meMarker = null;
+const $ = id => document.getElementById(id);
+const save = () => { localStorage.setItem('places', JSON.stringify(places)); localStorage.setItem('settings', JSON.stringify(S)); };
+
+const native = !!(window.Capacitor && Capacitor.isNativePlatform && Capacitor.isNativePlatform());
+const BG = native ? Capacitor.registerPlugin('BackgroundGeolocation') : null;
+const LN = native ? Capacitor.registerPlugin('LocalNotifications') : null;
+
+// ---------- helpers ----------
+function dist(a, b, c, d) {
+  const R = 6371000, r = x => x * Math.PI / 180;
+  const dLat = r(c - a), dLon = r(d - b);
+  const h = Math.sin(dLat/2)**2 + Math.cos(r(a)) * Math.cos(r(c)) * Math.sin(dLon/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+function setStatus(t) { $('status').textContent = t; }
+
+// ---------- map ----------
+let map = null, layer = null;
+try {
+  map = L.map('map').setView([52.37, 6.62], 12);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom:19, attribution:'© OpenStreetMap' }).addTo(map);
+  layer = L.layerGroup().addTo(map);
+  map.on('click', e => {
+    const name = prompt('Naam van deze plek?', 'Plus');
+    if (name) addPlace(name, e.latlng.lat, e.latlng.lng);
+  });
+} catch (e) { $('map').innerHTML = '<div class="mut" style="padding:12px">Kaart niet beschikbaar (offline?). De alarmen werken wel.</div>'; }
+
+function render() {
+  $('list').innerHTML = places.map(p =>
+    `<div class="row"><span>📍 ${p.name.replace(/</g,'&lt;')}</span><button class="del" data-id="${p.id}">✕</button></div>`).join('')
+    || '<div class="mut">Nog geen locaties.</div>';
+  document.querySelectorAll('.del').forEach(b => b.onclick = () => { places = places.filter(p => p.id != b.dataset.id); save(); render(); });
+  if (layer) {
+    layer.clearLayers();
+    places.forEach(p => {
+      L.marker([p.lat, p.lng]).bindPopup(p.name).addTo(layer);
+      L.circle([p.lat, p.lng], { radius:S.radius, color:'#ff3b30', weight:1 }).addTo(layer);
+    });
+  }
+}
+function addPlace(name, lat, lng) {
+  if (places.some(p => dist(p.lat, p.lng, lat, lng) < 25)) return false;
+  places.push({ id: Date.now() + Math.random(), name, lat, lng });
+  save(); render(); return true;
+}
+
+// ---------- settings UI ----------
+function loadSettings() {
+  $('radius').value = S.radius; $('rv').textContent = S.radius;
+  $('cooldown').value = S.cooldown; $('cv').textContent = S.cooldown;
+  $('beep').checked = S.beep; $('vibrate').checked = S.vibrate; $('speak').checked = S.speak;
+  $('message').value = S.message;
+}
+$('radius').oninput = e => { S.radius = +e.target.value; $('rv').textContent = S.radius; save(); render(); };
+$('cooldown').oninput = e => { S.cooldown = +e.target.value; $('cv').textContent = S.cooldown; save(); };
+['beep','vibrate','speak'].forEach(k => $(k).onchange = e => { S[k] = e.target.checked; save(); });
+$('message').oninput = e => { S.message = e.target.value; save(); };
+
+// ---------- alarm ----------
+function playBeep() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    [0, 0.35, 0.7].forEach(t => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = 'square'; o.frequency.value = 880; g.gain.value = 0.3;
+      o.connect(g); g.connect(ctx.destination);
+      o.start(ctx.currentTime + t); o.stop(ctx.currentTime + t + 0.25);
+    });
+  } catch (e) {}
+}
+async function fireAlarm(name, meters) {
+  const text = `${name}${meters != null ? ' (' + Math.round(meters) + ' m)' : ''}: ${S.message}`;
+  $('ovmsg').textContent = text; $('overlay').style.display = 'flex';
+  if (S.beep) playBeep();
+  if (S.vibrate && navigator.vibrate) navigator.vibrate([400, 200, 400, 200, 800]);
+  if (S.speak && window.speechSynthesis) {
+    const u = new SpeechSynthesisUtterance(S.message); u.lang = 'nl-NL'; speechSynthesis.speak(u);
+  }
+  if (LN) {
+    try {
+      await LN.schedule({ notifications: [{
+        id: Math.floor(Math.random() * 100000), title: '🛑 STOP! Plus in de buurt', body: text,
+        channelId: 'plusalarm', smallIcon: 'ic_stat_icon_config_sample' }] });
+    } catch (e) { console.log(e); }
+  }
+}
+$('ovok').onclick = () => { $('overlay').style.display = 'none'; if (window.speechSynthesis) speechSynthesis.cancel(); };
+$('test').onclick = () => fireAlarm('Test', 100);
+
+// ---------- location handling ----------
+function onPos(lat, lng, acc) {
+  me = { lat, lng };
+  setStatus(`Bewaking AAN · ${new Date().toLocaleTimeString()} · nauwkeurigheid ${Math.round(acc || 0)} m`);
+  if (map) {
+    if (!meMarker) meMarker = L.circleMarker([lat, lng], { radius:8, color:'#0a84ff' }).addTo(map);
+    else meMarker.setLatLng([lat, lng]);
+  }
+  const now = Date.now();
+  for (const p of places) {
+    const d = dist(lat, lng, p.lat, p.lng);
+    if (d <= S.radius && now - (lastAlert[p.id] || 0) > S.cooldown * 60000) {
+      lastAlert[p.id] = now;
+      fireAlarm(p.name, d);
+    }
+  }
+}
+
+async function start() {
+  if (native) {
+    try {
+      await LN.requestPermissions();
+      await LN.createChannel({ id:'plusalarm', name:'Plus Alarm', importance:5, vibration:true, visibility:1 });
+    } catch (e) {}
+    watcherId = await BG.addWatcher({
+      backgroundTitle: 'Plus Alarm actief',
+      backgroundMessage: 'Bewaakt je locatie',
+      requestPermissions: true, stale: false, distanceFilter: 10
+    }, (loc, err) => {
+      if (err) {
+        if (err.code === 'NOT_AUTHORIZED' && confirm('Locatie moet op "Altijd toestaan". Instellingen openen?')) BG.openSettings();
+        return;
+      }
+      onPos(loc.latitude, loc.longitude, loc.accuracy);
+    });
+  } else {
+    browserWatch = navigator.geolocation.watchPosition(
+      p => onPos(p.coords.latitude, p.coords.longitude, p.coords.accuracy),
+      e => setStatus('Locatiefout: ' + e.message), { enableHighAccuracy:true });
+  }
+  running = true; $('toggle').textContent = '⏹ STOP BEWAKING'; $('toggle').classList.add('on'); setStatus('Zoeken naar GPS…');
+}
+async function stop() {
+  if (native && watcherId) await BG.removeWatcher({ id: watcherId });
+  if (browserWatch != null) navigator.geolocation.clearWatch(browserWatch);
+  watcherId = browserWatch = null; running = false;
+  $('toggle').textContent = '▶ START BEWAKING'; $('toggle').classList.remove('on'); setStatus('Uit');
+}
+$('toggle').onclick = () => running ? stop() : start();
+
+// ---------- one-off position ----------
+function getOnce() {
+  return new Promise((res, rej) => navigator.geolocation.getCurrentPosition(
+    p => res(p.coords), e => rej(e), { enableHighAccuracy:true, timeout:15000 }));
+}
+$('addHere').onclick = async () => {
+  try {
+    const c = me || await getOnce();
+    const name = prompt('Naam van deze plek?', 'Plus');
+    if (name) { addPlace(name, c.latitude ?? c.lat, c.longitude ?? c.lng); }
+  } catch (e) { alert('Geen locatie: ' + (e.message || e)); }
+};
+
+// ---------- find all Plus stores (OpenStreetMap / Overpass) ----------
+$('findPlus').onclick = async () => {
+  try {
+    const c = me || await getOnce();
+    const lat = c.latitude ?? c.lat, lng = c.longitude ?? c.lng;
+    if (map) map.setView([lat, lng], 13);
+    const q = `[out:json][timeout:25];(nwr(around:15000,${lat},${lng})["shop"="supermarket"]["name"~"^Plus",i];);out center;`;
+    const r = await fetch('https://overpass-api.de/api/interpreter', { method:'POST', body:'data=' + encodeURIComponent(q) });
+    const data = await r.json();
+    let n = 0;
+    data.elements.forEach(el => {
+      const la = el.lat ?? el.center?.lat, lo = el.lon ?? el.center?.lon;
+      if (la && lo && addPlace(el.tags.name || 'Plus', la, lo)) n++;
+    });
+    alert(n + ' Plus-winkel(s) toegevoegd.');
+  } catch (e) { alert('Zoeken mislukt (internet aan?): ' + (e.message || e)); }
+};
+
+loadSettings(); render();
+</script>
+</body>
+</html>
